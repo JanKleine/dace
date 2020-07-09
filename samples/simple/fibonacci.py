@@ -4,7 +4,7 @@ import numpy as np
 
 @dp.program
 def fibonacci(iv: dp.int32[1], res: dp.float32[1]):
-    S = dp.define_stream(dp.int32, 0)
+    S = dp.define_stream(dp.int32, 500)
 
     # Initialize stream with input value
     @dp.tasklet
@@ -35,6 +35,20 @@ def fibonacci_py(v):
 
 
 if __name__ == '__main__':
+    
+    fibonacci = fibonacci.to_sdfg()
+    for node in fibonacci.nodes()[0].nodes():
+        print(node, type(node), [c.data for c in fibonacci.nodes()[0].in_edges(node)])
+    
+    from dace.transformation.interstate import GPUTransformSDFG
+    fibonacci.apply_transformations(GPUTransformSDFG,
+                                options={'sequential_innermaps': False},
+                                validate=True,
+                                validate_all=False,
+                                strict=True)
+    fibonacci.save('./sdfg/fib_gpu.sdfg')
+    fibonacci.validate()
+    
     print('Fibonacci recursion using consume - Python frontend')
     input = np.ndarray([1], np.int32)
     output = np.ndarray([1], np.float32)
@@ -42,8 +56,9 @@ if __name__ == '__main__':
     output[0] = 0
     regression = fibonacci_py(input[0])
 
-    fibonacci(input, output)
+    fibonacci(iv=input, res=output)
 
     diff = (regression - output[0])**2
+    print(regression)
     print('Difference:', diff)
     exit(0 if diff <= 1e-5 else 1)

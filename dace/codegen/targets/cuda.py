@@ -12,6 +12,7 @@ from dace import registry, subsets, symbolic, dtypes, data as dt
 from dace.config import Config
 from dace.sdfg import nodes
 from dace.sdfg import ScopeSubgraphView, SDFG, SDFGState, scope_contains_scope, is_devicelevel_gpu, is_array_stream_view, has_dynamic_map_inputs, dynamic_map_inputs
+from dace.dtypes import ScheduleType
 from dace.codegen.codeobject import CodeObject
 from dace.codegen.prettycode import CodeIOStream
 from dace.codegen.targets.target import (TargetCodeGenerator, IllegalCopy,
@@ -1062,10 +1063,15 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
             return
 
         # If not device-level code, ensure the schedule is correct
-        if scope_entry.map.schedule not in (dtypes.ScheduleType.GPU_Device,
-                                            dtypes.ScheduleType.GPU_Persistent):
+        if scope_entry.map.schedule not in (ScheduleType.GPU_Device,
+                                            ScheduleType.GPU_Persistent):
             raise TypeError('Cannot schedule %s directly from non-GPU code' %
                             str(scope_entry.map.schedule))
+
+        if isinstance(scope_entry, nodes.ConsumeEntry) \
+                and scope_entry.consume.schedule == ScheduleType.GPU_Persistent:
+            raise TypeError("Consumes cannot be scheduled as GPU_Persistent "
+                            "({})".format(str(scope_entry)))
 
         # Modify thread-blocks if dynamic ranges are detected
         for node, graph in dfg_scope.all_nodes_recursive():
@@ -1080,7 +1086,8 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
 
         # Determine whether to create a global (grid) barrier object
         create_grid_barrier = False
-        if scope_entry.map.schedule == dtypes.ScheduleType.GPU_Persistent:
+        if scope_entry.map.schedule == dtypes.ScheduleType.GPU_Persistent \
+                or isinstance(scope_entry, nodes.ConsumeEntry):
             create_grid_barrier = True
         for node in dfg_scope.nodes():
             if scope_entry == node:
@@ -1096,7 +1103,7 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
         # Comprehend grid/block dimensions from scopes
         grid_dims, block_dims, tbmap, dtbmap =\
             self.get_kernel_dimensions(dfg_scope)
-        is_persistent = (dfg_scope.source_nodes()[0].map.schedule
+        is_persistent = (scope_entry.map.schedule
                          == dtypes.ScheduleType.GPU_Persistent)
 
         # Get parameters of subgraph
@@ -1126,7 +1133,6 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
 
         const_params = _get_const_params(dfg_scope)
         # make dynamic map inputs constant
-        # TODO move this into _get_const_params(dfg_scope)
         const_params |= set((str(e.src)) for e
                             in dace.sdfg.dynamic_map_inputs(state, scope_entry))
 
@@ -1151,7 +1157,7 @@ void __dace_alloc_{location}(uint32_t {size}, dace::GPUStream<{type}, {is_pow2}>
                                 self.scope_exit_stream, self._globalcode)
 
         kernel_stream = CodeIOStream()
-        self.generate_kernel_scope(sdfg, dfg_scope, state_id, scope_entry.map,
+        self.generate_kernel_scope(sdfg, dfg_scope, state_id, scope_entry,
                                    kernel_name, grid_dims, block_dims, tbmap,
                                    dtbmap, kernel_args_typed, self._globalcode,
                                    kernel_stream)
@@ -1439,13 +1445,14 @@ cudaLaunchKernel((void*){kname}, dim3({gdims}), dim3({bdims}), {kname}_args, {dy
         return grid_size, block_size, True, has_dtbmap
 
     def generate_kernel_scope(self, sdfg: SDFG, dfg_scope: ScopeSubgraphView,
-                              state_id: int, kernel_map: nodes.Map,
+                              state_id: int, kernel_entry: nodes.EntryNode,
                               kernel_name: str, grid_dims: list,
                               block_dims: list, has_tbmap: bool,
                               has_dtbmap: bool, kernel_params: list,
                               function_stream: CodeIOStream,
                               kernel_stream: CodeIOStream):
-        node = dfg_scope.source_nodes()[0]
+        node = kernel_entry
+        kernel_map = kernel_entry.map
 
         # allocating shared memory for dynamic threadblock maps
         if has_dtbmap:
@@ -1578,6 +1585,101 @@ cudaLaunchKernel((void*){kname}, dim3({gdims}), dim3({bdims}), {kname}_args, {dy
                 else:
                     kernel_stream.write('{', sdfg, state_id, scope_entry)
 
+        if isinstance(node, nodes.ConsumeEntry):
+
+            state_dfg = sdfg.nodes()[state_id]
+
+            input_sedge = next(e for e in state_dfg.in_edges(node)
+                               if e.dst_conn == "IN_stream")
+            output_sedge = next(e for e in state_dfg.out_edges(node)
+                                if e.src_conn == "OUT_stream")
+            input_stream = state_dfg.memlet_path(input_sedge)[0].src
+            input_streamdesc = input_stream.desc(sdfg)
+
+            if node.consume.chunksize == 1:
+                chunk = "const %s& %s" % (
+                    input_streamdesc.dtype.ctype,
+                    "__dace_" + node.consume.label + "_element",
+                )
+                self._dispatcher.defined_vars.add(
+                    "__dace_" + node.consume.label + "_element", DefinedType.Scalar)
+            else:
+                chunk = "const %s *%s, size_t %s" % (
+                    input_streamdesc.dtype.ctype,
+                    "__dace_" + node.consume.label + "_elements",
+                    "__dace_" + node.consume.label + "_numelems",
+                )
+                self._dispatcher.defined_vars.add(
+                    "__dace_" + node.consume.label + "_elements",
+                    DefinedType.Pointer)
+                self._dispatcher.defined_vars.add(
+                    "__dace_" + node.consume.label + "_numelems",
+                    DefinedType.Scalar)
+
+            if node.consume.condition.code is not None:
+                condition_string = "[&]() { return %s; }, " % cppunparse.cppunparse(
+                    node.consume.condition.code, False)
+            else:
+                condition_string = ""
+
+            kernel_stream.write(
+                "dace::GPUConsume<{chunksz}>::template consume{cond}(__gbar, "
+                "{stream_in}, {num_pes}, {condition}"
+                "[&](int {pe_index}, {element_or_chunk}) {{".format(
+                    chunksz=node.consume.chunksize,
+                    cond="" if node.consume.condition.code is None else "_cond",
+                    condition=condition_string,
+                    stream_in=input_stream.data,  # TODO: stream arrays
+                    element_or_chunk=chunk,
+                    num_pes=sym2cpp(node.consume.num_pes),
+                    pe_index=node.consume.pe_index,
+                ),
+                sdfg,
+                state_id,
+                node,
+            )
+
+            # Since consume is an alias node, we create an actual array for the
+            # consumed element and modify the outgoing memlet path ("OUT_stream")
+            # TODO: do this before getting to the codegen
+            if node.consume.chunksize == 1:
+                newname, _ = sdfg.add_scalar("__dace_" + node.consume.label +
+                                             "_element",
+                                             input_streamdesc.dtype,
+                                             transient=True,
+                                             storage=dtypes.StorageType.Register,
+                                             find_new_name=True)
+                ce_node = nodes.AccessNode(newname, dtypes.AccessType.ReadOnly)
+            else:
+                newname, _ = sdfg.add_array("__dace_" + node.consume.label +
+                                            '_elements', [node.consume.chunksize],
+                                            input_streamdesc.dtype,
+                                            transient=True,
+                                            storage=dtypes.StorageType.Register,
+                                            find_new_name=True)
+                ce_node = nodes.AccessNode(newname, dtypes.AccessType.ReadOnly)
+            state_dfg.add_node(ce_node)
+            out_memlet_tree = state_dfg.memlet_tree(output_sedge)
+            root_edge = out_memlet_tree.root().edge
+            state_dfg.remove_edge(root_edge)
+            state_dfg.add_edge(
+                root_edge.src,
+                root_edge.src_conn,
+                ce_node,
+                None,
+                dace.Memlet.from_array(ce_node.data, ce_node.desc(sdfg)),
+            )
+            state_dfg.add_edge(
+                ce_node,
+                None,
+                root_edge.dst,
+                root_edge.dst_conn,
+                dace.Memlet.from_array(ce_node.data, ce_node.desc(sdfg)),
+            )
+            for e in out_memlet_tree:
+                e.data.data = ce_node.data
+            # END of SDFG-rewriting code
+
         self._dispatcher.dispatch_subgraph(sdfg,
                                            dfg_scope,
                                            state_id,
@@ -1702,7 +1804,7 @@ cudaLaunchKernel((void*){kname}, dim3({gdims}), dim3({bdims}), {kname}_args, {dy
             grid_dims, block_dims, has_tbmap, has_dtbmap = \
                 self.get_kernel_dimensions(dfg_scope)
 
-            if (self._kernel_map.map == dtypes.ScheduleType.GPU_Persistent
+            if (self._kernel_map.map.schedule == dtypes.ScheduleType.GPU_Persistent
                     and len(scope_map.params) > 1):
                 raise ValueError(
                     'Only one-dimensional device maps are currently supported '
@@ -2024,6 +2126,12 @@ cudaLaunchKernel((void*){kname}, dim3({gdims}), dim3({bdims}), {kname}_args, {dy
             callsite_stream.write('}', sdfg, state_id, node)
             return
 
+        self._cpu_codegen._generate_MapExit(sdfg, dfg, state_id, node,
+                                            function_stream, callsite_stream)
+
+    def _generate_ConsumeExit(self, sdfg, dfg, state_id, node, function_stream,
+                              callsite_stream):
+        callsite_stream.write("});", sdfg, state_id, node)
         self._cpu_codegen._generate_MapExit(sdfg, dfg, state_id, node,
                                             function_stream, callsite_stream)
 

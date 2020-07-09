@@ -451,7 +451,9 @@ class TargetDispatcher(object):
             if v in nodes_to_skip:
                 continue
 
-            if isinstance(v, nodes.MapEntry):
+            if isinstance(v, nodes.MapEntry) \
+                    or (isinstance(v, nodes.ConsumeEntry)
+                        and v.consume.schedule == dace.ScheduleType.GPU_Device):
                 scope_subgraph = sdfg.node(state_id).scope_subgraph(v)
 
                 self.dispatch_scope(v.map.schedule, sdfg, scope_subgraph,

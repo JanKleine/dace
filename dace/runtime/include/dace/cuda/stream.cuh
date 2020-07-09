@@ -86,6 +86,78 @@ namespace dace {
             return m_data[get_addr(allocation)];
         }
 
+        /**
+         * pop try
+         * 
+         * Pops an element from the stream as long as enough elements are
+         * available with warp level aggregation. All threads that get an
+         * element return 1, and place the popped element into `element`.
+         * `element` will be overwritten, but CANNOT be used when 0 is returned!
+         * 
+         * @param element reference to where the element is to be copied
+         * @return 1 iff element was popped for the calling thread, 0 otherwise.
+         */
+        // TODO add variant with chunk size (returns number of popped elements)
+        __device__ __forceinline__ int pop_try(T &element){
+
+            auto g = cooperative_groups::coalesced_threads();
+            int rank = g.thread_rank();
+            int size = g.size();
+
+            uint32_t old_start, new_start, assumed;
+
+            if (rank == 0) {
+                old_start = *m_start;
+                do {
+                    assumed = old_start;
+                    new_start = min(*m_end, assumed + size);
+                    old_start = atomicCAS(m_start, assumed, new_start);
+                } while (assumed != old_start);
+            }
+
+            new_start = g.shfl(new_start, 0);
+            old_start = g.shfl(old_start, 0);
+
+            // always fetch element to reduce warp divergence
+            element = m_data[get_addr(old_start + rank)];
+            return rank < (new_start - old_start);
+
+        }
+
+        // all threads are expected to call with the same count variable!
+        __device__ __forceinline__ int pop_soft(T* elements, uint32_t count){
+
+            auto g = cooperative_groups::coalesced_threads();
+            int rank = g.thread_rank();
+            int size = g.size();
+            int max_elements = size * count;
+
+            uint32_t old_start, new_start, assumed;
+
+            if (rank == 0) {
+                old_start = *m_start;
+                do {
+                    assumed = old_start;
+                    new_start = min(*m_end, assumed + max_elements);
+                    old_start = atomicCAS(m_start, assumed, new_start);
+                } while (assumed != old_start);
+            }
+
+            new_start = g.shfl(new_start, 0);
+            old_start = g.shfl(old_start, 0);
+
+            int num_elements = (new_start - old_start) / size;
+            int reset = (new_start - old_start) % size;
+            int offset = num_elements * rank + old_start;
+            offset += ((rank < reset) ? rank : reset);
+            num_elements += (rank < reset);
+
+            for (int i = 0; i < num_elements; i++) {
+                elements[i] = m_data[get_addr(offset + i)];
+            }
+            return num_elements;
+        }
+
         __device__ __forceinline__ T *leader_pop(uint32_t count) {
             uint32_t current = *m_start;
             T *result = m_data + get_addr(current);
@@ -146,14 +218,26 @@ namespace dace {
             return *m_end - *m_start;
         }
 
-        // Returns the 'count' of pending items and commits
+        /**
+         * commit_pending
+         *
+         * Commit all pending elements (added with `push()`) to stream. This
+         * should be executed by as few threads as possible (for example only
+         * one thread per thread block).
+         *
+         * @return number of committed elements
+         */
         __device__ __forceinline__ uint32_t commit_pending() const
         {
-            uint32_t count = *m_pending - *m_end;
-                
-            // Sync end with pending, this makes the pushed items visible to the consumer
-            *m_end = *m_pending;
-            return count;
+            uint32_t assumed, old_end = *m_end, new_end;
+
+            do {
+                assumed = old_end;
+                new_end = *m_pending;
+                old_end = atomicCAS(m_end, assumed, new_end);
+            } while (assumed != old_end);
+
+            return new_end - old_end;
         }
 
         __device__ __forceinline__ uint32_t get_start() const
@@ -164,6 +248,66 @@ namespace dace {
         __device__ __forceinline__ uint32_t get_start_delta(uint32_t prev_start) const
         {
             return prev_start - *m_start;
+        }
+    };
+
+    template <int CHUNKSIZE>
+    struct GPUConsume {
+        template <template <typename, bool> typename StreamT, typename T, bool ALIGNED,
+                  typename Functor>
+        __device__ __forceinline__ static void consume(StreamT<T, ALIGNED>& stream, unsigned num_threads,
+                            Functor&& contents) {
+            assert(false);
+        }
+
+        template <template <typename, bool> typename StreamT, typename T, bool ALIGNED,
+                  typename CondFunctor, typename Functor>
+        __device__ __forceinline__ static void consume_cond(StreamT<T, ALIGNED>& stream, unsigned num_threads,
+                                 CondFunctor&& quiescence, Functor&& contents) {
+            assert(false);
+        }
+    };
+
+    // Specialization for consumption of 1 element
+    template<>
+    struct GPUConsume<1> {
+        template <template <typename, bool> typename StreamT, typename T, bool ALIGNED, typename Functor>
+        __device__ __forceinline__ static void consume(cub::GridBarrier __gbar, StreamT<T, ALIGNED>& stream, unsigned num_threads, Functor&& contents) {
+
+            // continue flag in case of tbd map
+            cooperative_groups::thread_block block = cooperative_groups::this_thread_block();
+            int rank = block.thread_rank();
+            int idx = rank + (blockDim.x * blockIdx.x);
+
+            if (idx == 0) stream.commit_pending();
+            __gbar.Sync();
+
+            T element;
+            while (stream.count()) {
+                // all threads enter without changing the value
+                __gbar.Sync();
+                uint32_t popped = stream.pop_try(element);
+                // TODO do thread block thing
+
+                if (popped) {
+                    contents(idx, element);
+                }
+
+                block.sync();
+                if (rank == 0) {
+                    stream.commit_pending();
+                }
+
+                // wait for all thread to finish so the count value will be accurate
+                __gbar.Sync();
+            }
+        }
+
+        template <template <typename, bool> typename StreamT, typename T, bool ALIGNED,
+                  typename CondFunctor, typename Functor>
+        __device__ __forceinline__ static void consume_cond(StreamT<T, ALIGNED>& stream, unsigned num_threads,
+                                 CondFunctor&& quiescence, Functor&& contents) {
+            assert(false);
         }
     };
 

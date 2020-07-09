@@ -15,13 +15,15 @@ def gemm(A, B, C):
     # Transient variable
     tmp = dace.define_local([M, N, K], dtype=A.dtype)
 
-    @dace.map(_[0:M, 0:N, 0:K])
-    def multiplication(i, j, k):
-        in_A << A[i, k]
-        in_B << B[k, j]
-        out >> tmp[i, j, k]
+    for ignore in dace.map[0:1024]:
+        
+        @dace.map(_[0:M, 0:N, 0:K])
+        def multiplication(i, j, k):
+            in_A << A[i, k]
+            in_B << B[k, j]
+            out >> tmp[i, j, k]
 
-        out = in_A * in_B
+            out = in_A * in_B
 
     dace.reduce(lambda a, b: a + b, tmp, C, axis=2, identity=0)
 
@@ -46,6 +48,23 @@ if __name__ == "__main__":
     B = np.random.rand(K.get(), N.get()).astype(np.float64)
     C = np.zeros([M.get(), N.get()], dtype=np.float64)
     C_regression = np.zeros_like(C)
+
+    gemm = gemm.to_sdfg()
+
+    from dace.transformation.interstate import GPUTransformSDFG
+
+    gemm.apply_transformations(GPUTransformSDFG,
+                            options={'sequential_innermaps': False},
+                            validate=True,
+                            validate_all=False,
+                            strict=True)
+    gemm.validate()
+
+    for m in [k for k, v in gemm.node(0).scope_dict().items() if isinstance(k, dace.nodes.MapEntry) and v is None]:
+        m.map.schedule = dace.ScheduleType.GPU_Persistent
+    
+    for m in [k for k, v in gemm.node(0).scope_dict().items() if isinstance(k, dace.nodes.MapEntry) and v is not None]:
+        m.map.schedule = dace.ScheduleType.GPU_Device
 
     gemm(A, B, C)
 

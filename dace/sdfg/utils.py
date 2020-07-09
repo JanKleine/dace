@@ -442,7 +442,7 @@ def is_array_stream_view(sdfg: SDFG, dfg: SDFGState, node: nd.AccessNode):
 
 
 def dynamic_map_inputs(state: SDFGState,
-                       map_entry: nd.MapEntry) -> List[gr.MultiConnectorEdge]:
+                       map_entry: nd.EntryNode) -> List[gr.MultiConnectorEdge]:
     """
     For a given map entry node, returns a list of dynamic-range input edges.
     :param state: The state in which the map entry node resides.
