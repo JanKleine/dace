@@ -17,6 +17,8 @@
 
 #include "cudacommon.cuh"
 
+namespace cg = cooperative_groups;
+
 namespace dace {
     // Adapted from https://devblogs.nvidia.com/cuda-pro-tip-optimized-filtering-warp-aggregated-atomics/
     __inline__ __device__ uint32_t atomicAggInc(uint32_t *ctr) {
@@ -125,7 +127,7 @@ namespace dace {
         }
 
         // all threads are expected to call with the same count variable!
-        __device__ __forceinline__ int pop_soft(T* elements, uint32_t count){
+        __device__ __forceinline__ int pop_try(T* elements, uint32_t count){
 
             auto g = cooperative_groups::coalesced_threads();
             int rank = g.thread_rank();
@@ -251,12 +253,21 @@ namespace dace {
         }
     };
 
+    __device__ struct GPUConsumeData_t {
+        int32_t waiting; // #blocks currently waiting for work in wait loop
+        int32_t terminate; // if true all threads will termiante the consume
+        int32_t terminate_vote; // if != 0 blocks will vote weather to terminate
+        int32_t termiante_count; // number of blocks agreeing to termiante
+    } global;
+
     template <int CHUNKSIZE>
     struct GPUConsume {
         template <template <typename, bool> typename StreamT, typename T, bool ALIGNED,
                   typename Functor>
-        __device__ __forceinline__ static void consume(StreamT<T, ALIGNED>& stream, unsigned num_threads,
-                            Functor&& contents) {
+        __device__ __forceinline__ static void consume(
+                StreamT<T, ALIGNED>& stream,
+                unsigned num_threads,
+                Functor&& contents) {
             assert(false);
         }
 
@@ -271,35 +282,108 @@ namespace dace {
     // Specialization for consumption of 1 element
     template<>
     struct GPUConsume<1> {
-        template <template <typename, bool> typename StreamT, typename T, bool ALIGNED, typename Functor>
-        __device__ __forceinline__ static void consume(cub::GridBarrier __gbar, StreamT<T, ALIGNED>& stream, unsigned num_threads, Functor&& contents) {
 
-            // continue flag in case of tbd map
-            cooperative_groups::thread_block block = cooperative_groups::this_thread_block();
+        template <template <typename, bool> typename StreamT,
+                  typename T,
+                  bool ALIGNED,
+                  typename Functor>
+        __device__ __forceinline__ static void consume(
+                cub::GridBarrier __gbar,
+                StreamT<T, ALIGNED>& stream,
+                uint32_t num_threads,
+                Functor&& contents) {
+            
+            // init local values
+            uint32_t l_got_work = 0;
+            T work_item;
+
+            cg::thread_block block = cg::this_thread_block();
             int rank = block.thread_rank();
-            int idx = rank + (blockDim.x * blockIdx.x);
+            int idx = (blockDim.x * blockIdx.x) + rank;
+            int num_blocks = gridDim.x;
 
-            if (idx == 0) stream.commit_pending();
-            __gbar.Sync();
+            // init block values
+            __shared__ uint32_t s_got_work, s_final_try;
+            if (rank == 0) {
+                s_got_work = 0;
+                s_final_try = 0;
+            }
 
-            T element;
-            while (stream.count()) {
-                // all threads enter without changing the value
-                __gbar.Sync();
-                uint32_t popped = stream.pop_try(element);
-                // TODO do thread block thing
+            // init global values
+            if (idx == 0) {
+                global.waiting = 0;
+                global.terminate = 0;
+                global.terminate_vote = 0;
+                global.termiante_count = 0;
+                stream.commit_pending();
+            }
 
-                if (popped) {
-                    contents(idx, element);
-                }
+            // main loop, only left when consume terminates
+            while (!global.terminate) {
+                s_got_work = 0;
+                s_final_try = 0;
 
-                block.sync();
+                // enter waiting state
                 if (rank == 0) {
-                    stream.commit_pending();
+                    atomicAdd(&global.waiting, 1);
                 }
 
-                // wait for all thread to finish so the count value will be accurate
-                __gbar.Sync();
+                // wait for work until termination vode is held
+                while (!s_got_work && !global.terminate_vote) {
+
+                    if (rank == 0 && global.waiting == num_blocks) {
+                        s_final_try += 1;
+                    }
+
+                    // attempt to pop work from stream
+                    l_got_work = stream.pop_try(work_item);
+                    if (l_got_work) {
+                        s_got_work = 1;
+                    }
+                    block.sync();
+
+                    if (s_final_try >= 3) {
+                        // no working threads && no work => probably terminate
+                        if (!s_got_work) {
+                            global.terminate_vote = 1;
+                        } else {
+                            s_final_try = 0;
+                        }
+                    }
+
+                }
+
+                // leaving waiting state
+                if (rank == 0) {
+                    atomicAdd(&global.waiting, -1);
+                }
+
+                // execute termination vote
+                if (global.terminate_vote) {
+                    // blocks without work second the termination
+                    if (rank == 0 && !s_got_work && stream.count() == 0) {
+                        atomicAdd(&global.termiante_count, 1);
+                    }
+                    __gbar.Sync();
+
+                    // if a block oposes termination (i.e. not all blocks second
+                    // the decision) then termination is aborted
+                    if (global.termiante_count != num_blocks) {
+                        global.termiante_count = 0;
+                        global.terminate_vote = 0;
+                    } else {
+                        global.terminate = 1;
+                    }
+                }
+
+                // process working_item TODO support dynamic tb maps
+                if (s_got_work) {
+                    if (l_got_work) {
+                        contents(idx, work_item);
+                    }
+                    stream.commit_pending();
+                    block.sync();
+                }
             }
         }
 
