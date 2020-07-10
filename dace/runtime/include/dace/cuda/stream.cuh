@@ -316,7 +316,10 @@ namespace dace {
                 global.terminate_vote = 0;
                 global.termiante_count = 0;
                 stream.commit_pending();
+                // printf("%d elements in queue\n", stream.count());
             }
+
+            if (rank == 0) printf("Block %d entered consume\n", blockIdx.x);
 
             // main loop, only left when consume terminates
             while (!global.terminate) {
@@ -332,19 +335,24 @@ namespace dace {
                 while (!s_got_work && !global.terminate_vote) {
 
                     if (rank == 0 && global.waiting == num_blocks) {
+                        // printf("Block %d entering final try (%d)\n", blockIdx.x, global.waiting);
                         s_final_try += 1;
                     }
 
                     // attempt to pop work from stream
                     l_got_work = stream.pop_try(work_item);
+                    // printf("Thread %d of block %d (%d)\n", rank, blockIdx.x, l_got_work);
                     if (l_got_work) {
+                        // printf("Thread %d of block %d got work\n", rank, blockIdx.x);
                         s_got_work = 1;
                     }
                     block.sync();
+                    // if (rank == 0 && s_got_work) printf("Block %d got work\n", blockIdx.x);
 
                     if (s_final_try >= 3) {
                         // no working threads && no work => probably terminate
                         if (!s_got_work) {
+                            // if (rank == 0) printf("Block %d called for termination vote\n", blockIdx.x);
                             global.terminate_vote = 1;
                         } else {
                             s_final_try = 0;
@@ -360,6 +368,7 @@ namespace dace {
 
                 // execute termination vote
                 if (global.terminate_vote) {
+                    // if (rank == 0) printf("Block %d entered termination vote\n", blockIdx.x);
                     // blocks without work second the termination
                     if (rank == 0 && !s_got_work && stream.count() == 0) {
                         atomicAdd(&global.termiante_count, 1);
@@ -369,15 +378,18 @@ namespace dace {
                     // if a block oposes termination (i.e. not all blocks second
                     // the decision) then termination is aborted
                     if (global.termiante_count != num_blocks) {
+                        // if (rank == 0) printf("Block %d noted failed vote\n", blockIdx.x);
                         global.termiante_count = 0;
                         global.terminate_vote = 0;
                     } else {
+                        // if (rank == 0) printf("Block %d accepts termination\n", blockIdx.x);
                         global.terminate = 1;
                     }
                 }
 
                 // process working_item TODO support dynamic tb maps
                 if (s_got_work) {
+                    // if (rank == 0) printf("block %d enters working life\n", blockIdx.x);
                     if (l_got_work) {
                         contents(idx, work_item);
                     }
@@ -385,6 +397,7 @@ namespace dace {
                     block.sync();
                 }
             }
+            if (rank == 0) printf("Block %d terminating\n", blockIdx.x);
         }
 
         template <template <typename, bool> typename StreamT, typename T, bool ALIGNED,
