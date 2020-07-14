@@ -1680,12 +1680,62 @@ cudaLaunchKernel((void*){kname}, dim3({gdims}), dim3({bdims}), {kname}_args, {dy
                 e.data.data = ce_node.data
             # END of SDFG-rewriting code
 
-        self._dispatcher.dispatch_subgraph(sdfg,
+        if any((isinstance(node, dace.nodes.MapEntry)
+                and node != scope_entry
+                and node.map.schedule == dtypes.ScheduleType.GPU_ThreadBlock_Dynamic)
+               for node in dfg_scope.nodes()):
+
+            subgraphs = dace.sdfg.concurrent_subgraphs(dfg_scope)
+            for dfg in subgraphs:
+                components = dace.sdfg.utils.separate_maps(
+                    sdfg.nodes()[state_id],
+                    dfg,
+                    dtypes.ScheduleType.GPU_ThreadBlock_Dynamic,
+                )
+
+                for c in components:
+                    if not isinstance(c, dace.sdfg.scope.ScopeSubgraphView):
+                        kernel_stream.write('if ({} < {}) {{'.format(
+                            kernel_map.params[0],
+                            _topy(subsets
+                                  .Range(kernel_map.range[::-1])
+                                  .max_element()[0] + 1)
+                        ), sdfg, state_id, scope_entry)
+
+                    self._dispatcher.dispatch_subgraph(sdfg,
+                                                       c,
+                                                       state_id,
+                                                       function_stream,
+                                                       kernel_stream,
+                                                       skip_entry_node=False)
+
+                    if not isinstance(c, dace.sdfg.scope.ScopeSubgraphView):
+                        kernel_stream.write('}')
+
+            # exit node gets lost in the process, thus needs to be
+            # dispatched manually
+            self._dispatcher.dispatch_node(sdfg,
                                            dfg_scope,
                                            state_id,
+                                           dfg_scope.sink_nodes()[0],
                                            function_stream,
-                                           kernel_stream,
-                                           skip_entry_node=True)
+                                           kernel_stream)
+
+        else:
+            # Generate contents normally
+            self._dispatcher.dispatch_subgraph(sdfg,
+                                               dfg_scope,
+                                               state_id,
+                                               function_stream,
+                                               kernel_stream,
+                                               skip_entry_node=True)
+
+        # self._dispatcher.dispatch_subgraph(sdfg,
+        #                                    dfg_scope,
+        #                                    state_id,
+        #                                    function_stream,
+        #                                    kernel_stream,
+        #                                    skip_entry_node=True)
 
         if (not has_tbmap and not has_dtbmap
                 and node.map.schedule != dtypes.ScheduleType.GPU_Persistent):
