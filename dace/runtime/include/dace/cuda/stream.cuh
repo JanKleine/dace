@@ -75,6 +75,8 @@ namespace dace {
             }
         }
 
+        // test
+
         __device__ __forceinline__ void reset() const
         {
             *m_start = 0; 
@@ -181,7 +183,7 @@ namespace dace {
         {
             uint32_t allocation = atomicAggInc((uint32_t *) m_pending);
             m_data[get_addr(allocation)] = item;
-            printf("Thread %d of block %d pushed node %u with depth %u to stream\n", threadIdx.x, blockIdx.x, item.vertex, item.depth);
+            // printf("Thread %d of block %d pushed node %u with depth %u to stream\n", threadIdx.x, blockIdx.x, item.vertex, item.depth);
         }
 
         /*
@@ -243,7 +245,7 @@ namespace dace {
                 old_end = atomicCAS((uint32_t *) m_end, assumed, new_end);
             } while (assumed != old_end);
 
-            printf("element 0 after commiting is (%u, %u)\n", read(0).vertex, read(0).depth);
+            // printf("element 0 after commiting is (%u, %u)\n", read(0).vertex, read(0).depth);
 
             return new_end - old_end;
         }
@@ -380,12 +382,12 @@ namespace dace {
         }
     };
 
-__device__ struct GPUConsumeData_t {
-    volatile int32_t waiting; // #blocks currently waiting for work in wait loop
-    volatile int32_t terminate; // if true all threads will termiante the consume
-    volatile int32_t terminate_vote; // if != 0 blocks will vote weather to terminate
-    volatile int32_t termiante_count; // number of blocks agreeing to termiante
-} global;
+    __device__ struct GPUConsumeData_t {
+        volatile int32_t waiting; // #blocks currently waiting for work in wait loop
+        volatile int32_t terminate; // if true all threads will termiante the consume
+        volatile int32_t terminate_vote; // if != 0 blocks will vote weather to terminate
+        volatile int32_t termiante_count; // number of blocks agreeing to termiante
+    } global;
 
     template <int CHUNKSIZE>
     struct GPUConsume {
@@ -446,7 +448,7 @@ __device__ struct GPUConsumeData_t {
                 // printf("%d elements in queue\n", stream.count());
             }
 
-            if (rank == 0) printf("Block %d entered consume\n", blockIdx.x);
+            // if (rank == 0) printf("Block %d entered consume\n", blockIdx.x);
 
             __gbar.Sync();
 
@@ -457,30 +459,37 @@ __device__ struct GPUConsumeData_t {
                     s_got_work = 0;
                     s_final_try = 0;
                     atomicAdd((int32_t *) &global.waiting, 1);
+                    stream.commit_pending();
                 }
                 block.sync();
 
                 // wait for work until termination vode is held
                 while (!s_got_work && !global.terminate_vote) {
 
+                    // printf("alive\n");
+
                     // if (rank ==0) printf("Block %d trying to get work\n", blockIdx.x);
-                    if (rank == 0 && global.waiting == num_blocks) {
+                    if (rank == 0) {
+                        stream.commit_pending();
+                        if (global.waiting == num_blocks) {
                         // printf("Block %d entering final try (%d)\n", blockIdx.x, global.waiting);
-                        s_final_try += 1;
+                            s_final_try += 1;
+                        }
                     }
 
                     // attempt to pop work from stream if count is > 0
                     l_got_work = stream.pop_try(work_item);
                     // printf("Thread %d of block %d (%d)\n", rank, blockIdx.x, l_got_work);
                     if (l_got_work) {
-                        printf("Thread %d of block %d got work (vertex=%u, depth=%d)\n", rank, blockIdx.x, work_item.vertex, work_item.depth);
+                        // printf("Thread %d of block %d got work (vertex=%u, depth=%d)\n", rank, blockIdx.x, work_item.vertex, work_item.depth);
                         s_got_work = 1;
                     }
                     block.sync();
-                    if (rank == 0 && s_got_work) printf("Block %d got work\n", blockIdx.x);
+                    // if (rank == 0 && s_got_work) printf("Block %d got work\n", blockIdx.x);
 
                     if (rank == 0 && !s_got_work) {
-                        printf("Block %d got no work, retrying...\n", blockIdx.x);
+                        // printf("Block %d got no work, retrying...\n", blockIdx.x);
+                        __nanosleep(128);
                     }
 
                     if (rank == 0 && s_final_try >= 3) {
@@ -535,10 +544,9 @@ __device__ struct GPUConsumeData_t {
                         // printf("Thread %d of block %d sees Element 0 in stream as: v = %u, d = %u\n", rank, blockIdx.x, stream.read(0).vertex, stream.read(0).depth);
                     }
                     block.sync();
-                    if (rank == 0) stream.commit_pending();
                 }
             }
-            if (rank == 0) printf("Block %d terminating\n", blockIdx.x);
+            // if (rank == 0) printf("Block %d terminating\n", blockIdx.x);
             assert(stream.count() == 0);
             // assert(*stream.m_pending == *stream.m_end);
         }
