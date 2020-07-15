@@ -59,7 +59,7 @@ namespace dace {
     {
     public:
         T* m_data;
-        uint32_t *m_start, *m_end, *m_pending;
+        volatile uint32_t *m_start, *m_end, *m_pending;
         uint32_t m_capacity_mask;
 
         __host__ GPUStream() : m_data(nullptr), m_start(nullptr), m_end(nullptr),
@@ -84,7 +84,7 @@ namespace dace {
 
         __device__ __forceinline__ T pop()
         {
-            uint32_t allocation = atomicAggInc(m_start);
+            uint32_t allocation = atomicAggInc((uint32_t *) m_start);
             return m_data[get_addr(allocation)];
         }
 
@@ -102,7 +102,7 @@ namespace dace {
         // TODO add variant with chunk size (returns number of popped elements)
         __device__ __forceinline__ int pop_try(T &element){
 
-            auto g = cooperative_groups::coalesced_threads();
+            auto g = cg::coalesced_threads();
             int rank = g.thread_rank();
             int size = g.size();
 
@@ -113,9 +113,11 @@ namespace dace {
                 do {
                     assumed = old_start;
                     new_start = min(*m_end, assumed + size);
-                    old_start = atomicCAS(m_start, assumed, new_start);
+                    old_start = atomicCAS((uint32_t *) m_start, assumed, new_start);
                 } while (assumed != old_start);
+                // printf("Thread %d of block %d managed to get %d items for %d threads\n", threadIdx.x, blockIdx.x, (new_start - old_start), size);
             }
+            // g.sync();
 
             new_start = g.shfl(new_start, 0);
             old_start = g.shfl(old_start, 0);
@@ -129,7 +131,7 @@ namespace dace {
         // all threads are expected to call with the same count variable!
         __device__ __forceinline__ int pop_try(T* elements, uint32_t count){
 
-            auto g = cooperative_groups::coalesced_threads();
+            auto g = cg::coalesced_threads();
             int rank = g.thread_rank();
             int size = g.size();
             int max_elements = size * count;
@@ -141,7 +143,7 @@ namespace dace {
                 do {
                     assumed = old_start;
                     new_start = min(*m_end, assumed + max_elements);
-                    old_start = atomicCAS(m_start, assumed, new_start);
+                    old_start = atomicCAS((uint32_t *) m_start, assumed, new_start);
                 } while (assumed != old_start);
             }
 
@@ -177,8 +179,9 @@ namespace dace {
 
         __device__ __forceinline__ void push(const T& item)
         {
-            uint32_t allocation = atomicAggInc(m_pending);
+            uint32_t allocation = atomicAggInc((uint32_t *) m_pending);
             m_data[get_addr(allocation)] = item;
+            printf("Thread %d of block %d pushed node %u with depth %u to stream\n", threadIdx.x, blockIdx.x, item.vertex, item.depth);
         }
 
         /*
@@ -206,7 +209,7 @@ namespace dace {
 
         __device__ __forceinline__ void prepend(const T& item)
         {
-            uint32_t allocation = atomicAggDec(m_start) - 1;
+            uint32_t allocation = atomicAggDec((uint32_t *) m_start) - 1;
             m_data[get_addr(allocation)] = item;
         }
 
@@ -232,12 +235,15 @@ namespace dace {
         __device__ __forceinline__ uint32_t commit_pending() const
         {
             uint32_t assumed, old_end = *m_end, new_end;
-
+            // printf("Thread %d of block %d commiting %u pendings\n", threadIdx.x, blockIdx.x, (*m_pending - *m_end));
+            // __threadfence();
             do {
                 assumed = old_end;
                 new_end = *m_pending;
-                old_end = atomicCAS(m_end, assumed, new_end);
+                old_end = atomicCAS((uint32_t *) m_end, assumed, new_end);
             } while (assumed != old_end);
+
+            printf("element 0 after commiting is (%u, %u)\n", read(0).vertex, read(0).depth);
 
             return new_end - old_end;
         }
@@ -253,12 +259,133 @@ namespace dace {
         }
     };
 
-    __device__ struct GPUConsumeData_t {
-        int32_t waiting; // #blocks currently waiting for work in wait loop
-        int32_t terminate; // if true all threads will termiante the consume
-        int32_t terminate_vote; // if != 0 blocks will vote weather to terminate
-        int32_t termiante_count; // number of blocks agreeing to termiante
-    } global;
+    template<typename T, bool IS_POWEROFTWO = false>
+    class GPUStreamBroker
+    {
+    public:
+        T* m_data;
+        uint32_t *m_head, *m_tail, *m_ticket;
+        int32_t *m_count;
+        uint32_t m_capacity_mask, m_capacity, max_threads = 128; // TODO remove hardcode
+
+        __host__ __device__ GPUStreamBroker(T* data, uint32_t *ticket, uint32_t capacity,
+                                      uint32_t *head, uint32_t *tail, uint32_t *count) :
+                                      m_data(data), m_ticket(ticket), m_head(head), m_tail(tail),
+                                      m_count((int32_t *) count),
+                                      m_capacity_mask(IS_POWEROFTWO ? (capacity - 1) : capacity),
+                                      m_capacity(capacity)
+        {
+            if (IS_POWEROFTWO) {
+                assert((capacity - 1 & capacity) == 0); // Must be a power of two for handling circular overflow correctly  
+            }
+        }
+
+        __device__ __forceinline__ void reset() {
+            *m_head = 0; 
+            *m_tail = 0;
+            *m_count = 0;
+            for (int i = 0; i < m_capacity; i++) {
+                m_ticket[i] = 0;
+            }
+        }
+
+        __device__ __forceinline__ bool push(T& item) {
+            while (!ensureEnqueue()) {
+                uint32_t head = *m_head;
+                uint32_t tail = *m_tail;
+                if (m_capacity <= tail - head && tail - head < m_capacity + max_threads/2) {
+                    return false;
+                }
+            }
+            putData(item);
+            return true;
+        }
+
+        __device__ __forceinline__ bool ensureEnqueue () {
+            uint32_t num = *m_count;
+            while (true) {
+                if (num >= m_capacity) {
+                    return false;
+                }
+                if (atomicAdd(m_count, 1) < m_capacity) {
+                    return true;
+                }
+                num = atomicAdd(m_count, -1) - 1;
+            }
+        }
+
+        __device__ __forceinline__ bool putData(T& item) {
+            uint32_t pos = atomicAdd(m_tail, 1);
+            uint32_t p = get_addr(pos);
+            waitForTicket(p, 2 * (pos / m_capacity));
+            m_data[p] = item;
+            m_ticket[p] = 2 * (pos / m_capacity) + 1;
+        }
+
+        __device__ __forceinline__ bool pop(T& item) {
+            while (!ensureDequeue()) {
+                uint32_t head = *m_head;
+                uint32_t tail = *m_tail;
+                if (m_capacity + max_threads / 2 <= tail - head - 1) {
+                    return false; 
+                }
+            }
+            item = readData();
+            return true;
+        }
+
+        __device__ __forceinline__ bool ensureDequeue() {
+            uint32_t num = *m_count;
+            while (true) {
+                if (num <= 0) {
+                    return false;
+                }
+                if (atomicAdd(m_count, -1) > 0) {
+                    return true;
+                }
+                num = atomicAdd(m_count, 1) + 1;
+            }
+        }
+
+        __device__ __forceinline__ T readData() {
+            uint32_t pos = atomicAdd(m_head, 1);
+            uint32_t p = get_addr(pos);
+            waitForTicket(p,  2 * (pos / m_capacity) + 1);
+            T item = m_data[p];
+            m_ticket[p] = 2 * ((pos + m_capacity)/ m_capacity);
+            return item;
+        }
+
+        __device__ __forceinline__ int waitForTicket(uint32_t pos, uint32_t expected) {
+            uint32_t ticket = m_ticket[pos];
+            uint32_t ns = 8;
+            while (ticket != expected) {
+                __nanosleep(ns); //TODO remove because need compute capability >= 7.0
+                ticket = m_ticket[pos];
+                if (ns < 256) {
+                    ns *= 2;
+                }
+            }
+        }
+
+        __device__ __forceinline__ uint32_t get_addr(const uint32_t& i) const {
+            if (IS_POWEROFTWO)
+                return i & m_capacity_mask;
+            else
+                return i % m_capacity_mask;
+        }
+
+        __device__ __forceinline__ uint32_t count() {
+            return *m_head - *m_tail;
+        }
+    };
+
+__device__ struct GPUConsumeData_t {
+    volatile int32_t waiting; // #blocks currently waiting for work in wait loop
+    volatile int32_t terminate; // if true all threads will termiante the consume
+    volatile int32_t terminate_vote; // if != 0 blocks will vote weather to terminate
+    volatile int32_t termiante_count; // number of blocks agreeing to termiante
+} global;
 
     template <int CHUNKSIZE>
     struct GPUConsume {
@@ -303,7 +430,7 @@ namespace dace {
             int num_blocks = gridDim.x;
 
             // init block values
-            __shared__ uint32_t s_got_work, s_final_try;
+            __shared__ volatile uint32_t s_got_work, s_final_try;
             if (rank == 0) {
                 s_got_work = 0;
                 s_final_try = 0;
@@ -321,49 +448,57 @@ namespace dace {
 
             if (rank == 0) printf("Block %d entered consume\n", blockIdx.x);
 
+            __gbar.Sync();
+
             // main loop, only left when consume terminates
             while (!global.terminate) {
-                s_got_work = 0;
-                s_final_try = 0;
-
                 // enter waiting state
                 if (rank == 0) {
-                    atomicAdd(&global.waiting, 1);
+                    s_got_work = 0;
+                    s_final_try = 0;
+                    atomicAdd((int32_t *) &global.waiting, 1);
                 }
+                block.sync();
 
                 // wait for work until termination vode is held
                 while (!s_got_work && !global.terminate_vote) {
 
+                    // if (rank ==0) printf("Block %d trying to get work\n", blockIdx.x);
                     if (rank == 0 && global.waiting == num_blocks) {
                         // printf("Block %d entering final try (%d)\n", blockIdx.x, global.waiting);
                         s_final_try += 1;
                     }
 
-                    // attempt to pop work from stream
+                    // attempt to pop work from stream if count is > 0
                     l_got_work = stream.pop_try(work_item);
                     // printf("Thread %d of block %d (%d)\n", rank, blockIdx.x, l_got_work);
                     if (l_got_work) {
-                        // printf("Thread %d of block %d got work\n", rank, blockIdx.x);
+                        printf("Thread %d of block %d got work (vertex=%u, depth=%d)\n", rank, blockIdx.x, work_item.vertex, work_item.depth);
                         s_got_work = 1;
                     }
                     block.sync();
-                    // if (rank == 0 && s_got_work) printf("Block %d got work\n", blockIdx.x);
+                    if (rank == 0 && s_got_work) printf("Block %d got work\n", blockIdx.x);
 
-                    if (s_final_try >= 3) {
+                    if (rank == 0 && !s_got_work) {
+                        printf("Block %d got no work, retrying...\n", blockIdx.x);
+                    }
+
+                    if (rank == 0 && s_final_try >= 3) {
                         // no working threads && no work => probably terminate
                         if (!s_got_work) {
-                            // if (rank == 0) printf("Block %d called for termination vote\n", blockIdx.x);
+                            // printf("Block %d called for termination vote\n", blockIdx.x);
                             global.terminate_vote = 1;
                         } else {
                             s_final_try = 0;
                         }
                     }
+                    block.sync();
 
                 }
 
                 // leaving waiting state
                 if (rank == 0) {
-                    atomicAdd(&global.waiting, -1);
+                    atomicAdd((int32_t *) &global.waiting, -1);
                 }
 
                 // execute termination vote
@@ -371,20 +506,23 @@ namespace dace {
                     // if (rank == 0) printf("Block %d entered termination vote\n", blockIdx.x);
                     // blocks without work second the termination
                     if (rank == 0 && !s_got_work && stream.count() == 0) {
-                        atomicAdd(&global.termiante_count, 1);
+                        atomicAdd((int32_t *) &global.termiante_count, 1);
                     }
                     __gbar.Sync();
 
                     // if a block oposes termination (i.e. not all blocks second
                     // the decision) then termination is aborted
-                    if (global.termiante_count != num_blocks) {
-                        // if (rank == 0) printf("Block %d noted failed vote\n", blockIdx.x);
-                        global.termiante_count = 0;
-                        global.terminate_vote = 0;
-                    } else {
-                        // if (rank == 0) printf("Block %d accepts termination\n", blockIdx.x);
-                        global.terminate = 1;
+                    if (idx == 0) {
+                        if (global.termiante_count != num_blocks) {
+                            // printf("Block %d noted failed vote\n", blockIdx.x);
+                            global.termiante_count = 0;
+                            global.terminate_vote = 0;
+                        } else {
+                            // printf("Block %d accepts termination\n", blockIdx.x);
+                            global.terminate = 1;
+                        }
                     }
+                    __gbar.Sync();
                 }
 
                 // process working_item TODO support dynamic tb maps
@@ -392,18 +530,23 @@ namespace dace {
                     // if (rank == 0) printf("block %d enters working life\n", blockIdx.x);
                     if (l_got_work) {
                         contents(idx, work_item);
+                        // __threadfence();
+                        
+                        // printf("Thread %d of block %d sees Element 0 in stream as: v = %u, d = %u\n", rank, blockIdx.x, stream.read(0).vertex, stream.read(0).depth);
                     }
-                    stream.commit_pending();
                     block.sync();
+                    if (rank == 0) stream.commit_pending();
                 }
             }
             if (rank == 0) printf("Block %d terminating\n", blockIdx.x);
+            assert(stream.count() == 0);
+            // assert(*stream.m_pending == *stream.m_end);
         }
 
         template <template <typename, bool> typename StreamT, typename T, bool ALIGNED,
                   typename CondFunctor, typename Functor>
         __device__ __forceinline__ static void consume_cond(StreamT<T, ALIGNED>& stream, unsigned num_threads,
-                                 CondFunctor&& quiescence, Functor&& contents) {
+                                    CondFunctor&& quiescence, Functor&& contents) {
             assert(false);
         }
     };
