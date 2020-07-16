@@ -55,16 +55,16 @@ namespace dace {
     * @brief A device-level MPMC Queue
     */
     template<typename T, bool IS_POWEROFTWO = false>
-    class GPUStream
+    class GPUStreamOLD
     {
     public:
         T* m_data;
         volatile uint32_t *m_start, *m_end, *m_pending;
         uint32_t m_capacity_mask;
 
-        __host__ GPUStream() : m_data(nullptr), m_start(nullptr), m_end(nullptr),
+        __host__ GPUStreamOLD() : m_data(nullptr), m_start(nullptr), m_end(nullptr),
             m_pending(nullptr), m_capacity_mask(0) {}
-        __host__ __device__ GPUStream(T* data, uint32_t capacity,
+        __host__ __device__ GPUStreamOLD(T* data, uint32_t capacity,
                                       uint32_t *start, uint32_t *end, 
                                       uint32_t *pending) :
             m_data(data), m_start(start), m_end(end), m_pending(pending),
@@ -74,8 +74,6 @@ namespace dace {
                 assert((capacity - 1 & capacity) == 0); // Must be a power of two for handling circular overflow correctly  
             }
         }
-
-        // test
 
         __device__ __forceinline__ void reset() const
         {
@@ -262,17 +260,22 @@ namespace dace {
     };
 
     template<typename T, bool IS_POWEROFTWO = false>
-    class GPUStreamBroker
+    class GPUStream
     {
     public:
         T* m_data;
-        uint32_t *m_head, *m_tail, *m_ticket;
-        int32_t *m_count;
-        uint32_t m_capacity_mask, m_capacity, max_threads = 128; // TODO remove hardcode
+        volatile uint32_t *m_head, *m_tail;
+        volatile uint64_t *m_head_tail;
+        uint32_t *m_ticket;
+        volatile int32_t *m_count;
+        uint32_t m_capacity_mask, m_capacity, max_threads = 10752; // TODO remove hardcode
 
-        __host__ __device__ GPUStreamBroker(T* data, uint32_t *ticket, uint32_t capacity,
-                                      uint32_t *head, uint32_t *tail, uint32_t *count) :
-                                      m_data(data), m_ticket(ticket), m_head(head), m_tail(tail),
+        __host__ __device__ GPUStream(T* data, uint32_t *ticket, uint32_t capacity,
+                                      uint64_t *head_tail, uint32_t *count) :
+                                      m_data(data), m_ticket(ticket),
+                                      m_head_tail(head_tail),
+                                      m_head(&(((uint32_t *) head_tail)[0])),
+                                      m_tail(&(((uint32_t *) head_tail)[1])),
                                       m_count((int32_t *) count),
                                       m_capacity_mask(IS_POWEROFTWO ? (capacity - 1) : capacity),
                                       m_capacity(capacity)
@@ -293,9 +296,11 @@ namespace dace {
 
         __device__ __forceinline__ bool push(T& item) {
             while (!ensureEnqueue()) {
-                uint32_t head = *m_head;
-                uint32_t tail = *m_tail;
-                if (m_capacity <= tail - head && tail - head < m_capacity + max_threads/2) {
+                uint64_t head_tail = *m_head_tail;
+                uint32_t head = ((uint32_t *) &head_tail)[0];
+                uint32_t tail = ((uint32_t *) &head_tail)[1];
+                if (m_capacity <= tail - head && tail - head < m_capacity + max_threads / 2) {
+                    printf("Push failed for thread %d of block %d\n", threadIdx.x, blockIdx.x);
                     return false;
                 }
             }
@@ -309,26 +314,30 @@ namespace dace {
                 if (num >= m_capacity) {
                     return false;
                 }
-                if (atomicAdd(m_count, 1) < m_capacity) {
+                if (atomicAdd((int32_t *) m_count, 1) < m_capacity) {
                     return true;
                 }
-                num = atomicAdd(m_count, -1) - 1;
+                num = atomicAdd((int32_t *) m_count, -1) - 1;
             }
         }
 
-        __device__ __forceinline__ bool putData(T& item) {
-            uint32_t pos = atomicAdd(m_tail, 1);
+        __device__ __forceinline__ void putData(T& item) {
+            uint32_t pos = atomicAdd((uint32_t *) m_tail, 1);
             uint32_t p = get_addr(pos);
+            printf("Thread %d of block %d waitong to push data (current count = %u)\n", threadIdx.x, blockIdx.x, count());
             waitForTicket(p, 2 * (pos / m_capacity));
+            printf("Thread %d of block %d finished putting data\n", threadIdx.x, blockIdx.x);
             m_data[p] = item;
             m_ticket[p] = 2 * (pos / m_capacity) + 1;
         }
 
         __device__ __forceinline__ bool pop(T& item) {
             while (!ensureDequeue()) {
-                uint32_t head = *m_head;
-                uint32_t tail = *m_tail;
+                uint64_t head_tail = *m_head_tail;
+                uint32_t head = ((uint32_t *) &head_tail)[0];
+                uint32_t tail = ((uint32_t *) &head_tail)[1];
                 if (m_capacity + max_threads / 2 <= tail - head - 1) {
+                    
                     return false; 
                 }
             }
@@ -342,28 +351,30 @@ namespace dace {
                 if (num <= 0) {
                     return false;
                 }
-                if (atomicAdd(m_count, -1) > 0) {
+                if (atomicAdd((int32_t *) m_count, -1) > 0) {
                     return true;
                 }
-                num = atomicAdd(m_count, 1) + 1;
+                num = atomicAdd((int32_t *) m_count, 1) + 1;
             }
         }
 
         __device__ __forceinline__ T readData() {
-            uint32_t pos = atomicAdd(m_head, 1);
+            uint32_t pos = atomicAdd((uint32_t *) m_head, 1);
             uint32_t p = get_addr(pos);
+            printf("Thread %d of block %d waitng for data (current count = %u)\n", threadIdx.x, blockIdx.x, count());
             waitForTicket(p,  2 * (pos / m_capacity) + 1);
+            printf("Thread %d of block %d got data\n", threadIdx.x, blockIdx.x);
             T item = m_data[p];
             m_ticket[p] = 2 * ((pos + m_capacity)/ m_capacity);
             return item;
         }
 
-        __device__ __forceinline__ int waitForTicket(uint32_t pos, uint32_t expected) {
+        __device__ __forceinline__ void waitForTicket(uint32_t pos, uint32_t expected) {
             uint32_t ticket = m_ticket[pos];
             uint32_t ns = 8;
             while (ticket != expected) {
                 __nanosleep(ns); //TODO remove because need compute capability >= 7.0
-                ticket = m_ticket[pos];
+                ticket = ((volatile uint32_t *)m_ticket)[pos];
                 if (ns < 256) {
                     ns *= 2;
                 }
@@ -378,7 +389,7 @@ namespace dace {
         }
 
         __device__ __forceinline__ uint32_t count() {
-            return *m_head - *m_tail;
+            return *m_tail - *m_head;
         }
     };
 
@@ -444,7 +455,7 @@ namespace dace {
                 global.terminate = 0;
                 global.terminate_vote = 0;
                 global.termiante_count = 0;
-                stream.commit_pending();
+                // stream.commit_pending();
                 // printf("%d elements in queue\n", stream.count());
             }
 
@@ -459,18 +470,19 @@ namespace dace {
                     s_got_work = 0;
                     s_final_try = 0;
                     atomicAdd((int32_t *) &global.waiting, 1);
-                    stream.commit_pending();
+                    // stream.commit_pending();
                 }
                 block.sync();
 
                 // wait for work until termination vode is held
                 while (!s_got_work && !global.terminate_vote) {
 
-                    // printf("alive\n");
+                    //printf("alive\n");
 
                     // if (rank ==0) printf("Block %d trying to get work\n", blockIdx.x);
                     if (rank == 0) {
-                        stream.commit_pending();
+                        printf("block %d alive\n", blockIdx.x);
+                        // stream.commit_pending();
                         if (global.waiting == num_blocks) {
                         // printf("Block %d entering final try (%d)\n", blockIdx.x, global.waiting);
                             s_final_try += 1;
@@ -478,24 +490,24 @@ namespace dace {
                     }
 
                     // attempt to pop work from stream if count is > 0
-                    l_got_work = stream.pop_try(work_item);
+                    l_got_work = stream.pop(work_item);
                     // printf("Thread %d of block %d (%d)\n", rank, blockIdx.x, l_got_work);
                     if (l_got_work) {
-                        // printf("Thread %d of block %d got work (vertex=%u, depth=%d)\n", rank, blockIdx.x, work_item.vertex, work_item.depth);
+                        printf("Thread %d of block %d got work (vertex=%u, depth=%d)\n", rank, blockIdx.x, work_item.vertex, work_item.depth);
                         s_got_work = 1;
                     }
                     block.sync();
                     // if (rank == 0 && s_got_work) printf("Block %d got work\n", blockIdx.x);
 
                     if (rank == 0 && !s_got_work) {
-                        // printf("Block %d got no work, retrying...\n", blockIdx.x);
-                        __nanosleep(128);
+                        printf("Block %d got no work, retrying...\n", blockIdx.x);
+                        // __nanosleep(128);
                     }
 
                     if (rank == 0 && s_final_try >= 3) {
                         // no working threads && no work => probably terminate
                         if (!s_got_work) {
-                            // printf("Block %d called for termination vote\n", blockIdx.x);
+                            printf("Block %d called for termination vote\n", blockIdx.x);
                             global.terminate_vote = 1;
                         } else {
                             s_final_try = 0;
@@ -539,8 +551,6 @@ namespace dace {
                     // if (rank == 0) printf("block %d enters working life\n", blockIdx.x);
                     if (l_got_work) {
                         contents(idx, work_item);
-                        // __threadfence();
-                        
                         // printf("Thread %d of block %d sees Element 0 in stream as: v = %u, d = %u\n", rank, blockIdx.x, stream.read(0).vertex, stream.read(0).depth);
                     }
                     block.sync();
@@ -600,14 +610,15 @@ namespace dace {
     template<typename T, bool IS_POW2>
     GPUStream<T, IS_POW2> AllocGPUArrayStreamView(T *ptr, uint32_t capacity)
     {
-        uint32_t *gStart, *gEnd, *gPending;
-        DACE_CUDA_CHECK(cudaMalloc(&gStart, sizeof(uint32_t)));
-        DACE_CUDA_CHECK(cudaMalloc(&gEnd, sizeof(uint32_t)));
-        DACE_CUDA_CHECK(cudaMalloc(&gPending, sizeof(uint32_t)));
-        DACE_CUDA_CHECK(cudaMemset(gStart, 0, sizeof(uint32_t)));
-        DACE_CUDA_CHECK(cudaMemset(gEnd, 0, sizeof(uint32_t)));
-        DACE_CUDA_CHECK(cudaMemset(gPending, 0, sizeof(uint32_t)));
-        return GPUStream<T, IS_POW2>(ptr, capacity, gStart, gEnd, gPending);
+        uint32_t *gTicket, *gCount;
+        uint64_t *gHeadTail;
+        DACE_CUDA_CHECK(cudaMalloc(&gHeadTail, sizeof(uint64_t)));
+        DACE_CUDA_CHECK(cudaMalloc(&gCount, sizeof(uint32_t)));
+        DACE_CUDA_CHECK(cudaMalloc(&gTicket, capacity * sizeof(uint32_t)));
+        DACE_CUDA_CHECK(cudaMemset(gHeadTail, 0, sizeof(uint64_t)));
+        DACE_CUDA_CHECK(cudaMemset(gCount, 0, sizeof(uint32_t)));
+        DACE_CUDA_CHECK(cudaMemset(gTicket, 0, capacity * sizeof(uint32_t)));
+        return GPUStream<T, IS_POW2>(ptr, gTicket, capacity, gHeadTail, gCount);
     }
 
     template<typename T, bool IS_POW2>

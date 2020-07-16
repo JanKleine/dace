@@ -23,25 +23,39 @@ namespace dace {
     {
     public:
         T* m_data;
-        uint32_t *m_start, *m_end, *m_pending;
-        uint32_t m_capacity_mask;
+        // uint32_t *m_head, *m_tail;
+        uint64_t *m_head_tail;
+        uint32_t *m_ticket;
+        int32_t *m_count;
+        uint32_t m_capacity_mask, m_capacity, max_threads = 128;
 
-        GPUStream() : m_data(nullptr), m_start(nullptr), m_end(nullptr),
-            m_pending(nullptr), m_capacity_mask(0) {}
-        GPUStream(T* data, uint32_t capacity,
-                  uint32_t *start, uint32_t *end,
-                  uint32_t *pending) :
-            m_data(data), m_start(start), m_end(end), m_pending(pending),
-            m_capacity_mask(IS_POWEROFTWO ? (capacity - 1) : capacity)
-        { }
+        GPUStream() : m_data(nullptr), m_ticket(nullptr),
+                    m_head_tail(nullptr),
+                    // m_head(nullptr),
+                    // m_tail(nullptr),
+                    m_count(nullptr),
+                    m_capacity_mask(0),
+                    m_capacity(0) {}
+        GPUStream(T* data, uint32_t *ticket, uint32_t capacity,
+                    uint64_t *head_tail, uint32_t *count) :
+                    m_data(data), m_ticket(ticket),
+                    m_head_tail(head_tail),
+                    // m_head(&(((uint32_t *) head_tail)[0])),
+                    // m_tail(&(((uint32_t *) head_tail)[1])),
+                    m_count((int32_t *) count),
+                    m_capacity_mask(IS_POWEROFTWO ? (capacity - 1) : capacity),
+                    m_capacity(capacity)
+        {
+            assert(false);
+        }
     };
 
     template<typename T, bool IS_POW2>
     void FreeGPUArrayStreamView(GPUStream<T, IS_POW2>& stream)
     {
-        DACE_CUDA_CHECK(cudaFree(stream.m_start));
-        DACE_CUDA_CHECK(cudaFree(stream.m_end));
-        DACE_CUDA_CHECK(cudaFree(stream.m_pending));
+        DACE_CUDA_CHECK(cudaFree(stream.m_head_tail));
+        DACE_CUDA_CHECK(cudaFree(stream.m_count));
+        DACE_CUDA_CHECK(cudaFree(stream.m_ticket));
     }
 
     template<typename T, bool IS_POW2>
